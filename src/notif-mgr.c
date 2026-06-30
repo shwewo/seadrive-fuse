@@ -4,6 +4,11 @@
 #include <libwebsockets.h>
 #include <string.h>
 #include <glib.h>
+#ifndef USE_GPL_CRYPTO
+#include <openssl/ssl.h>
+#include <openssl/pkcs12.h>
+#include <openssl/x509.h>
+#endif
 
 #include "seafile-session.h"
 #include "notif-mgr.h"
@@ -41,6 +46,9 @@ typedef struct NotifServer {
     char    *path;
     int     port;
 
+#ifndef USE_GPL_CRYPTO
+    SSL_CTX *ssl_ctx;
+#endif
     gint    refcnt;
 } NotifServer;
 
@@ -158,7 +166,7 @@ static void
 notif_server_ref (NotifServer *server);
 
 static struct lws_context *
-lws_context_new (int port);
+lws_context_new (NotifServer *server, gboolean use_ssl, const char *host);
 
 static NotifServer*
 notif_new_server (const char *server_url, gboolean use_notif_server_port)
@@ -184,20 +192,20 @@ notif_new_server (const char *server_url, gboolean use_notif_server_port)
     if (strncmp(server_url, "https", 5) == 0) {
         use_ssl = TRUE;
     }
-    
 
-    context = lws_context_new (use_ssl);
+    server = g_new0 (NotifServer, 1);
+    server->messages = g_async_queue_new ();
+
+    context = lws_context_new (server, use_ssl, uri->host);
     if (!context) {
+        g_async_queue_unref (server->messages);
+        g_free (server);
         g_free (uri->scheme);
         g_free (uri->host);
         g_free (uri);
         seaf_warning ("failed to create libwebsockets context\n");
         return NULL;
     }
-
-    server = g_new0 (NotifServer, 1);
-
-    server->messages = g_async_queue_new ();
 
     server->context = context;
     server->server_url = g_strdup (server_url);
@@ -250,6 +258,10 @@ notif_server_free (NotifServer *server)
         return;
     if (server->context)
         lws_context_destroy(server->context);
+#ifndef USE_GPL_CRYPTO
+    if (server->ssl_ctx)
+        SSL_CTX_free (server->ssl_ctx);
+#endif
     g_free (server->server_url);
     g_free (server->addr);
     g_free (server->path);
@@ -369,6 +381,10 @@ static int
 event_callback (struct lws *wsi, enum lws_callback_reasons reason,
                 void *user, void *in, size_t len)
 {
+    /* lws passes SSL_CTX* as 'user' for this callback, not a NotifServer. */
+    if (reason == LWS_CALLBACK_OPENSSL_LOAD_EXTRA_CLIENT_VERIFY_CERTS)
+        return 0;
+
     NotifServer *server = (NotifServer *)user;
     Message *msg = NULL;
     int m;
@@ -793,10 +809,13 @@ static const struct lws_protocols protocols[] = {
 };
 
 static struct lws_context *
-lws_context_new (gboolean use_ssl)
+lws_context_new (NotifServer *server, gboolean use_ssl, const char *host)
 {
     struct lws_context_creation_info info;
     struct lws_context *context = NULL;
+#ifndef USE_GPL_CRYPTO
+    char *cert_path = NULL, *key_path = NULL, *cert_type = NULL, *password = NULL;
+#endif
 
     memset(&info, 0, sizeof info);
     info.port = CONTEXT_PORT_NO_LISTEN;
@@ -810,9 +829,92 @@ lws_context_new (gboolean use_ssl)
     if (use_ssl) {
          info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
          info.client_ssl_ca_filepath = ca_path;
+
+#ifndef USE_GPL_CRYPTO
+         /* Mutual TLS: present the client certificate configured for this host. */
+         if (http_tx_manager_get_client_cert (host, &cert_path, &key_path,
+                                              &cert_type, &password) &&
+             cert_path && cert_path[0]) {
+             if (cert_type && g_ascii_strcasecmp (cert_type, "P12") == 0) {
+                 /* lws cannot load PKCS#12 directly. Build a pre-configured
+                  * SSL_CTX with the parsed cert/key and hand it to lws via
+                  * provided_client_ssl_ctx so lws skips its own cert setup. */
+                 SSL_CTX *ssl_ctx = SSL_CTX_new (TLS_client_method ());
+                 if (ssl_ctx) {
+                     SSL_CTX_set_verify (ssl_ctx, SSL_VERIFY_PEER, NULL);
+                     if (SSL_CTX_load_verify_locations (ssl_ctx, ca_path, NULL) != 1)
+                         SSL_CTX_set_default_verify_paths (ssl_ctx);
+
+                     FILE *fp = g_fopen (cert_path, "rb");
+                     if (fp) {
+                         PKCS12 *p12 = d2i_PKCS12_fp (fp, NULL);
+                         fclose (fp);
+                         if (p12) {
+                             EVP_PKEY *pkey = NULL;
+                             X509 *x509 = NULL;
+                             STACK_OF(X509) *ca = NULL;
+                             if (PKCS12_parse (p12, password ? password : "",
+                                               &pkey, &x509, &ca)) {
+                                 if (x509 && pkey) {
+                                     int i;
+                                     SSL_CTX_use_certificate (ssl_ctx, x509);
+                                     SSL_CTX_use_PrivateKey (ssl_ctx, pkey);
+                                     if (ca)
+                                         for (i = 0; i < sk_X509_num (ca); i++) {
+                                             X509 *dup = X509_dup (sk_X509_value (ca, i));
+                                             if (dup)
+                                                 SSL_CTX_add_extra_chain_cert (ssl_ctx, dup);
+                                         }
+                                     server->ssl_ctx = ssl_ctx;
+                                     info.provided_client_ssl_ctx = ssl_ctx;
+                                     seaf_message ("Loaded PKCS#12 client certificate "
+                                                   "%s for notifications.\n", cert_path);
+                                 } else {
+                                     seaf_warning ("PKCS#12 bundle %s is missing "
+                                                   "certificate or key\n", cert_path);
+                                     SSL_CTX_free (ssl_ctx);
+                                 }
+                                 EVP_PKEY_free (pkey);
+                                 X509_free (x509);
+                                 if (ca) sk_X509_pop_free (ca, X509_free);
+                             } else {
+                                 seaf_warning ("Failed to decrypt PKCS#12 bundle %s "
+                                               "(wrong password?)\n", cert_path);
+                                 SSL_CTX_free (ssl_ctx);
+                             }
+                             PKCS12_free (p12);
+                         } else {
+                             seaf_warning ("Failed to parse PKCS#12 bundle %s\n",
+                                           cert_path);
+                             SSL_CTX_free (ssl_ctx);
+                         }
+                     } else {
+                         seaf_warning ("Failed to open PKCS#12 bundle %s: %s\n",
+                                       cert_path, strerror (errno));
+                         SSL_CTX_free (ssl_ctx);
+                     }
+                 }
+             } else {
+                 /* PEM certificate (+ optional key) loaded directly by lws. */
+                 info.client_ssl_cert_filepath = cert_path;
+                 if (key_path && key_path[0])
+                     info.client_ssl_private_key_filepath = key_path;
+                 if (password && password[0])
+                     info.client_ssl_private_key_password = password;
+             }
+         }
+#endif
     }
 
     context = lws_create_context(&info);
+
+#ifndef USE_GPL_CRYPTO
+    g_free (cert_path);
+    g_free (key_path);
+    g_free (cert_type);
+    g_free (password);
+#endif
+
     if (!context) {
         g_free (ca_path);
         seaf_warning ("failed to create libwebsockets context\n");

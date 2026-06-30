@@ -120,6 +120,13 @@ struct _HttpTxTask {
 };
 typedef struct _HttpTxTask HttpTxTask;
 
+#ifndef USE_GPL_CRYPTO
+gboolean
+http_tx_manager_get_client_cert (const char *host,
+                                 char **cert_path, char **key_path,
+                                 char **cert_type, char **password);
+#endif
+
 HttpTxManager *
 http_tx_manager_new (struct _SeafileSession *seaf);
 

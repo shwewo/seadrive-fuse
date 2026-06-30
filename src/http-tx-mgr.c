@@ -64,6 +64,27 @@ struct _ConnectionPool {
 };
 typedef struct _ConnectionPool ConnectionPool;
 
+/* Per-host mutual-TLS client certificate. */
+typedef struct ClientCert {
+    char *cert_path;
+    char *key_path;
+    char *cert_type;    /* "PEM" or "P12" */
+    char *password;
+} ClientCert;
+
+static void
+client_cert_free (void *data)
+{
+    ClientCert *c = data;
+    if (!c)
+        return;
+    g_free (c->cert_path);
+    g_free (c->key_path);
+    g_free (c->cert_type);
+    g_free (c->password);
+    g_free (c);
+}
+
 struct _HttpTxPriv {
     GHashTable *download_tasks;
     GHashTable *upload_tasks;
@@ -74,6 +95,11 @@ struct _HttpTxPriv {
     SeafTimer *reset_bytes_timer;
 
     char *env_ca_bundle_path;
+
+    GHashTable *client_certs;          /* host (lowercase) -> ClientCert* */
+    pthread_mutex_t client_certs_lock;
+    char *client_certs_path;
+    gint64 client_certs_mtime;
 
     // Uploaded file count
     gint uploaded;
@@ -295,6 +321,13 @@ http_tx_manager_new (struct _SeafileSession *seaf)
     priv->connection_pools = g_hash_table_new (g_str_hash, g_str_equal);
     pthread_mutex_init (&priv->pools_lock, NULL);
 
+    priv->client_certs = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                g_free, client_cert_free);
+    pthread_mutex_init (&priv->client_certs_lock, NULL);
+    priv->client_certs_path = g_build_filename (seaf->seaf_dir,
+                                                "client-ssl-certs.json", NULL);
+    priv->client_certs_mtime = 0;
+
     env_ca_path = g_getenv("SEAFILE_SSL_CA_PATH");
     if (env_ca_path)
         priv->env_ca_bundle_path = g_strdup (env_ca_path);
@@ -421,6 +454,148 @@ load_ca_bundle(CURL *curl)
         curl_easy_setopt (curl, CURLOPT_CAINFO, ca_path);
 }
 
+/* Extract the (lowercased) host from a URL like "https://host:port/path". */
+static char *
+parse_host_from_url (const char *url)
+{
+    const char *p, *end;
+    char *host, *lower;
+
+    if (!url)
+        return NULL;
+
+    p = strstr (url, "://");
+    p = p ? p + 3 : url;
+    end = p;
+    while (*end && *end != '/' && *end != ':' && *end != '?')
+        end++;
+    if (end == p)
+        return NULL;
+
+    host = g_strndup (p, end - p);
+    lower = g_ascii_strdown (host, -1);
+    g_free (host);
+    return lower;
+}
+
+/* (Re)load the per-host certificate map if the backing file changed.
+ * Caller must hold priv->client_certs_lock. */
+static void
+reload_client_certs (HttpTxPriv *priv)
+{
+    GStatBuf st;
+    json_t *root;
+    json_error_t jerror;
+    const char *host;
+    json_t *entry;
+
+    if (g_stat (priv->client_certs_path, &st) != 0) {
+        if (g_hash_table_size (priv->client_certs) > 0)
+            g_hash_table_remove_all (priv->client_certs);
+        priv->client_certs_mtime = 0;
+        return;
+    }
+
+    if ((gint64)st.st_mtime == priv->client_certs_mtime)
+        return;
+    priv->client_certs_mtime = (gint64)st.st_mtime;
+
+    g_hash_table_remove_all (priv->client_certs);
+
+    root = json_load_file (priv->client_certs_path, 0, &jerror);
+    if (!root) {
+        seaf_warning ("Failed to parse %s: %s\n",
+                      priv->client_certs_path, jerror.text);
+        return;
+    }
+    if (!json_is_object (root)) {
+        json_decref (root);
+        return;
+    }
+
+    json_object_foreach (root, host, entry) {
+        if (!json_is_object (entry))
+            continue;
+        const char *cert_path = json_string_value (json_object_get (entry, "cert_path"));
+        if (!cert_path || cert_path[0] == 0)
+            continue;
+        ClientCert *c = g_new0 (ClientCert, 1);
+        c->cert_path = g_strdup (cert_path);
+        c->key_path = g_strdup (json_string_value (json_object_get (entry, "key_path")));
+        c->cert_type = g_strdup (json_string_value (json_object_get (entry, "cert_type")));
+        c->password = g_strdup (json_string_value (json_object_get (entry, "cert_password")));
+        g_hash_table_insert (priv->client_certs, g_ascii_strdown (host, -1), c);
+    }
+
+    json_decref (root);
+}
+
+gboolean
+http_tx_manager_get_client_cert (const char *host,
+                                 char **cert_path, char **key_path,
+                                 char **cert_type, char **password)
+{
+    HttpTxPriv *priv = seaf->http_tx_mgr->priv;
+    ClientCert *c;
+    char *h = host ? g_ascii_strdown (host, -1) : NULL;
+    gboolean found = FALSE;
+
+    *cert_path = *key_path = *cert_type = *password = NULL;
+
+    pthread_mutex_lock (&priv->client_certs_lock);
+    reload_client_certs (priv);
+    if (h && (c = g_hash_table_lookup (priv->client_certs, h)) != NULL) {
+        *cert_path = g_strdup (c->cert_path);
+        *key_path = g_strdup (c->key_path);
+        *cert_type = g_strdup (c->cert_type);
+        *password = g_strdup (c->password);
+        found = TRUE;
+    }
+    pthread_mutex_unlock (&priv->client_certs_lock);
+    g_free (h);
+
+    return found;
+}
+
+static void
+load_client_cert (CURL *curl, const char *url)
+{
+    char *host = parse_host_from_url (url);
+    char *cert_path = NULL, *key_path = NULL, *cert_type = NULL, *password = NULL;
+
+    if (!http_tx_manager_get_client_cert (host, &cert_path, &key_path,
+                                          &cert_type, &password)) {
+        g_free (host);
+        return;
+    }
+
+    if (cert_path && cert_path[0]) {
+        if (!seaf_util_exists (cert_path)) {
+            seaf_warning ("Client TLS certificate %s does not exist, "
+                          "mutual TLS disabled for this request.\n", cert_path);
+        } else {
+            curl_easy_setopt (curl, CURLOPT_SSLCERT, cert_path);
+            if (cert_type && cert_type[0])
+                curl_easy_setopt (curl, CURLOPT_SSLCERTTYPE, cert_type);
+
+            if (key_path && key_path[0]) {
+                curl_easy_setopt (curl, CURLOPT_SSLKEY, key_path);
+                if (cert_type && cert_type[0])
+                    curl_easy_setopt (curl, CURLOPT_SSLKEYTYPE, cert_type);
+            }
+
+            if (password && password[0])
+                curl_easy_setopt (curl, CURLOPT_KEYPASSWD, password);
+        }
+    }
+
+    g_free (host);
+    g_free (cert_path);
+    g_free (key_path);
+    g_free (cert_type);
+    g_free (password);
+}
+
 #endif  /* USE_GPL_CRYPTO */
 
 static void
@@ -543,6 +718,9 @@ http_get_common (CURL *curl, const char *url,
 
     gboolean is_https = (strncasecmp(url, "https", strlen("https")) == 0);
     set_proxy (curl, is_https);
+#ifndef USE_GPL_CRYPTO
+    load_client_cert (curl, url);
+#endif
 
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_UNRESTRICTED_AUTH, 1L);
@@ -810,6 +988,9 @@ http_put (CURL *curl, const char *url, const char *token,
 
     gboolean is_https = (strncasecmp(url, "https", strlen("https")) == 0);
     set_proxy (curl, is_https);
+#ifndef USE_GPL_CRYPTO
+    load_client_cert (curl, url);
+#endif
 
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
@@ -907,6 +1088,9 @@ http_post_common (CURL *curl, const char *url,
 
     gboolean is_https = (strncasecmp(url, "https", strlen("https")) == 0);
     set_proxy (curl, is_https);
+#ifndef USE_GPL_CRYPTO
+    load_client_cert (curl, url);
+#endif
 
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTREDIR, CURL_REDIR_POST_ALL);
@@ -1090,6 +1274,9 @@ http_delete_common (CURL *curl, const char *url,
 
     gboolean is_https = (strncasecmp(url, "https", strlen("https")) == 0);
     set_proxy (curl, is_https);
+#ifndef USE_GPL_CRYPTO
+    load_client_cert (curl, url);
+#endif
 
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_UNRESTRICTED_AUTH, 1L);
